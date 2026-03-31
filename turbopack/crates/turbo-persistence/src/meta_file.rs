@@ -3,6 +3,7 @@ use std::{
     fmt::Display,
     fs::File,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::OnceLock,
 };
 
@@ -11,7 +12,7 @@ use bitfield::bitfield;
 use byteorder::{BE, ReadBytesExt};
 use memmap2::{Mmap, MmapOptions};
 use smallvec::SmallVec;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, big_endian as be};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Ref, big_endian as be};
 
 use crate::{
     QueryKey,
@@ -91,6 +92,8 @@ impl EntryHeader {
 /// `MetaEntry` stores a `FilterRef<'static>` with a transmuted lifetime that actually borrows
 /// from the parent [`MetaFile`]'s mmap. This is safe because entries are only accessed by
 /// reference through `MetaFile` and are never moved out.
+///
+/// For this reason this type should not implement Clone or Copy.
 pub struct MetaEntry {
     /// The metadata for the static sorted file.
     sst_data: StaticSortedFileMetaData,
@@ -251,7 +254,7 @@ pub struct MetaFile {
     /// The memory mapped file.
     /// The entire memory-mapped file. Must be the last field that matters for drop order —
     /// `entries` contains `FilterRef`s that borrow from this mmap.
-    mmap: Mmap,
+    mmap: Pin<Mmap>,
 }
 
 impl MetaFile {
@@ -297,13 +300,10 @@ impl MetaFile {
         let mut entries = Vec::with_capacity(count as usize);
         let mut start_of_amqf_data_offset: u32 = 0;
         for _ in 0..count {
-            let header = EntryHeader::read_from_prefix(reader)
-                .map(|(h, rest)| {
-                    reader = rest;
-                    h
-                })
+            let (header, rest): (Ref<&[u8], EntryHeader>, _) = Ref::from_prefix(reader)
                 .ok()
                 .context("Entry header out of bounds")?;
+            reader = rest;
             let sst_data = StaticSortedFileMetaData {
                 sequence_number: header.sequence_number.get(),
                 block_count: header.block_count.get(),
@@ -318,8 +318,6 @@ impl MetaFile {
                 .get(start_of_amqf_data_offset as usize..end_of_amqf_data_offset as usize)
                 .expect("AMQF data out of bounds");
             // Deserialize the filter borrowing from the mmap, then erase the lifetime.
-            // Safety: the mmap is kept alive by MetaFile and is dropped after entries (field
-            // declaration order), so the borrow remains valid for the lifetime of the MetaEntry.
             let amqf: qfilter::FilterRef<'_> =
                 postcard::from_bytes(amqf_bytes).with_context(|| {
                     format!(
@@ -327,6 +325,8 @@ impl MetaFile {
                         sequence_number, sst_data.sequence_number
                     )
                 })?;
+            // Safety: the mmap is kept alive by MetaFile and is dropped after entries (field
+            // declaration order), so the borrow remains valid for the lifetime of the MetaEntry.
             let amqf: qfilter::FilterRef<'static> = unsafe { std::mem::transmute(amqf) };
 
             entries.push(MetaEntry {
@@ -356,7 +356,7 @@ impl MetaFile {
             amqf_data_start,
             start_of_used_keys_amqf_data_offset,
             end_of_used_keys_amqf_data_offset,
-            mmap,
+            mmap: Pin::new(mmap),
         })
     }
 
